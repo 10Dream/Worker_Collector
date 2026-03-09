@@ -303,7 +303,7 @@ async function fetchAndFilterConfigs(sources, logger = null) {
 
   if (logger) {
     const total = ALL_PROTOCOLS.reduce((acc, p) => acc + result[p].length, 0);
-    const summary = diag.map(d => `@${d.channel}: pages=${d.pages}, blocks=${d.blocks}, today=${d.todayBlocks}, links=${d.extracted}${d.httpError ? `, http=${d.httpError}` : ''}`).join(' | ');
+    const summary = diag.map(d => `@${d.channel}: pages=${d.pages}, blocks=${d.blocks}, today=${d.todayBlocks}, links=${d.extracted}${d.httpError ? `, http=${d.httpError}` : ''}${d.noBlockPages ? `, noblock=${d.noBlockPages}` : ''}${d.pageLen ? `, len=${d.pageLen}` : ''}${d.hasChannelHeader === false ? ', header=no' : ''}`).join(' | ');
     await logger.log("INFO", `CFG debug -> channels=${channels.length}, total=${total}; ${summary || 'no channels'}`);
   }
 
@@ -664,7 +664,7 @@ async function fetchAndFilterProxies(sources, logger = null) {
     else standard.push(proxy);
   }
   if (logger) {
-    const summary = diag.map(d => `@${d.channel}: pages=${d.pages}, blocks=${d.blocks}, today=${d.todayBlocks}, links=${d.extracted}${d.httpError ? `, http=${d.httpError}` : ''}`).join(' | ');
+    const summary = diag.map(d => `@${d.channel}: pages=${d.pages}, blocks=${d.blocks}, today=${d.todayBlocks}, links=${d.extracted}${d.httpError ? `, http=${d.httpError}` : ''}${d.noBlockPages ? `, noblock=${d.noBlockPages}` : ''}${d.pageLen ? `, len=${d.pageLen}` : ''}${d.hasChannelHeader === false ? ', header=no' : ''}`).join(' | ');
     await logger.log("INFO", `PRX debug -> channels=${channels.length}, total=${allSet.size}, windows=${windows.length}, standard=${standard.length}; ${summary || 'no channels'}`);
   }
   return { standard, windows };
@@ -716,6 +716,21 @@ function decodeHtmlEntities(s) {
   return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 }
 
+
+function extractTelegramMessageBlocks(html) {
+  const patterns = [
+    /<article[^>]*class="[^"]*tgme_widget_message[^"]*"[\s\S]*?<\/article>/g,
+    /<div[^>]*class="[^"]*tgme_widget_message_wrap[^"]*"[\s\S]*?<\/div>\s*<\/div>/g,
+    /<div[^>]*class="[^"]*tgme_widget_message(?!_text)[^"]*"[\s\S]*?<\/div>\s*<\/div>/g
+  ];
+
+  for (const re of patterns) {
+    const arr = [...html.matchAll(re)].map(m => m[0]);
+    if (arr.length) return arr;
+  }
+  return [];
+}
+
 async function scrapeTodayChannelMessages(channel, maxPages = 12, stats = null) {
   const today = new Date().toISOString().slice(0, 10);
   let before = '';
@@ -724,15 +739,28 @@ async function scrapeTodayChannelMessages(channel, maxPages = 12, stats = null) 
   for (let i = 0; i < maxPages; i++) {
     if (stats) stats.pages += 1;
     const url = `https://t.me/s/${channel}${before ? `?before=${before}` : ''}`;
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', 'Accept-Language': 'en-US,en;q=0.9', 'Referer': 'https://t.me/' } });
     if (!res.ok) { if (stats) stats.httpError = res.status; break; }
 
     const html = await res.text();
-    let blocks = [...html.matchAll(/<div class="tgme_widget_message_wrap"[\s\S]*?<\/article>\s*<\/div>/g)].map(m => m[0]);
-    if (!blocks.length) {
-      blocks = [...html.matchAll(/<div class="tgme_widget_message"[\s\S]*?<\/div>\s*<\/div>/g)].map(m => m[0]);
+    if (stats && i === 0) {
+      stats.pageLen = html.length;
+      stats.hasChannelHeader = html.includes('tgme_channel_info') || html.includes('tgme_widget_message');
     }
-    if (!blocks.length) break;
+
+    let blocks = extractTelegramMessageBlocks(html);
+    if (!blocks.length) {
+      // آخرین fallback: قطعه‌بندی بر اساس data-post
+      const chunks = html.split('data-post="');
+      if (chunks.length > 1) {
+        blocks = chunks.slice(1).map(c => 'data-post="' + c).filter(c => c.includes('datetime="'));
+      }
+    }
+
+    if (!blocks.length) {
+      if (stats) stats.noBlockPages = (stats.noBlockPages || 0) + 1;
+      break;
+    }
     if (stats) stats.blocks += blocks.length;
 
     let seenOlder = false;
