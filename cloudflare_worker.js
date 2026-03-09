@@ -940,11 +940,11 @@ function generateHTML() {
 
         const initProtocolsGrid = () => {
             const grid = document.getElementById('protocols-grid');
-            grid.innerHTML = ALL_PROTOCOLS.map(p => `
+            grid.innerHTML = ALL_PROTOCOLS.map(p => \`
                 <div class="proto-item">
-                    <label><input type="checkbox" id="chk_${p}"> ${p.toUpperCase()}</label>
-                    <input type="number" id="qty_${p}" min="0" placeholder="تعداد">
-                </div>`).join('');
+                    <label><input type="checkbox" id="chk_\${p}"> \${p.toUpperCase()}</label>
+                    <input type="number" id="qty_\${p}" min="0" placeholder="تعداد">
+                </div>\`).join('');
         };
 
         async function loadData() {
