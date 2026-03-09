@@ -6,7 +6,8 @@
 // لیست پروتکل‌های اصلی و استاندارد شده برای نمایش در منوها (ترکیب شده‌ها)
 const ALL_PROTOCOLS = [
   'vmess', 'vless', 'trojan', 'ss', 'ssr', 'tuic', 'hysteria', 'hysteria2', 
-  'juicity', 'snell', 'anytls', 'ssh', 'wireguard', 'socks', 'cloudflare'
+  'juicity', 'snell', 'anytls', 'ssh', 'wireguard', 'socks',
+  'dns', 'nm-dns', 'nm-vless', 'slipnet-enc', 'slipnet', 'slipstream', 'dnstt'
 ];
 
 // مپ کردن پیشوندهای لینک به پروتکل اصلی (ترکیب هوشمند)
@@ -33,7 +34,7 @@ const CONFIG_REGEX = new RegExp(`(?:${EXTRACT_PROTOCOLS.map(p => p.replace('-', 
 const DEFAULT_PROTOCOLS_STATE = {};
 ALL_PROTOCOLS.forEach(p => {
   DEFAULT_PROTOCOLS_STATE[p] = { 
-    enabled: ['vless', 'vmess', 'trojan', 'wireguard', 'cloudflare'].includes(p), 
+    enabled: ['vless', 'vmess', 'trojan', 'wireguard', 'dns'].includes(p), 
     qty: 2 
   };
 });
@@ -271,29 +272,6 @@ function fixWireguardConfig(link) {
   } catch (e) { return link; }
 }
 
-function isBehindCloudflare(link) {
-  const cfDomains = ['.workers.dev', '.pages.dev', '.trycloudflare.com', 'chatgpt.com', 'cloudflare.com'];
-  const check = (d) => {
-    if (!d) return false;
-    const lowerD = d.toLowerCase();
-    return cfDomains.some(cf => lowerD.endsWith(cf) || lowerD === cf);
-  };
-
-  try {
-    if (link.toLowerCase().startsWith('vmess://')) {
-      let b64 = link.slice(8);
-      while (b64.length % 4 !== 0) b64 += '=';
-      let jsonStr = decodeURIComponent(escape(atob(b64)));
-      let data = JSON.parse(jsonStr);
-      return check(data.add) || check(data.host) || check(data.sni);
-    } else {
-      let dummyUrlStr = link.replace(/^[a-zA-Z0-9]+:\/\//i, 'http://');
-      let parsed = new URL(dummyUrlStr);
-      return check(parsed.hostname) || check(parsed.searchParams.get('sni')) || check(parsed.searchParams.get('host')) || check(parsed.searchParams.get('peer'));
-    }
-  } catch (e) { return false; }
-}
-
 async function fetchAndFilterConfigs(sources) {
   let configsByProtocol = {};
   ALL_PROTOCOLS.forEach(p => configsByProtocol[p] = new Set());
@@ -307,16 +285,13 @@ async function fetchAndFilterConfigs(sources) {
       if (protoMatch) {
         const raw = protoMatch[1];
         const mapped = PROTOCOL_ALIASES[raw] || raw;
-        if (ALL_PROTOCOLS.includes(mapped) && mapped !== 'cloudflare') {
+        if (ALL_PROTOCOLS.includes(mapped)) {
           matchedCanonicalProto = mapped;
           if (matchedCanonicalProto === 'wireguard') line = fixWireguardConfig(line);
           configsByProtocol[matchedCanonicalProto].add(cleanLink(line));
         }
       }
 
-      if (matchedCanonicalProto && isBehindCloudflare(line)) {
-        configsByProtocol['cloudflare'].add(cleanLink(line));
-      }
     }
   }
 
@@ -387,7 +362,7 @@ async function handleTelegramUpdate(update, env, settings, logger) {
       let activeProtocols = Object.keys(settings.protocols).filter(p => settings.protocols[p].enabled);
       
       activeProtocols.forEach((p, index) => {
-        let btnText = p === 'cloudflare' ? '☁️ کلادفلر (ویژه)' : p.toUpperCase();
+        let btnText = p.toUpperCase();
         row.push({ text: btnText, callback_data: `cfg_sel_${p}` });
         if (row.length === 2 || index === activeProtocols.length - 1) {
           inline_keyboard.push(row);
@@ -404,7 +379,7 @@ async function handleTelegramUpdate(update, env, settings, logger) {
     }
     else if (data.startsWith("cfg_sel_")) {
       const proto = data.replace("cfg_sel_", "");
-      const protoName = proto === 'cloudflare' ? 'کلادفلر' : proto.toUpperCase();
+      const protoName = proto.toUpperCase();
       const keyboard = {
         inline_keyboard: [
           [{ text: "۵ عدد", callback_data: `cfg_get_${proto}_5` }, { text: "۱۰ عدد", callback_data: `cfg_get_${proto}_10` }],
@@ -477,7 +452,7 @@ async function sendConfigsToUser(chatId, proto, qty, env, sources, logger) {
 
   shuffleArray(available);
   const selection = available.slice(0, qty === Infinity ? available.length : qty);
-  const protoDisplay = proto === 'cloudflare' ? 'Cloudflare' : proto.toUpperCase();
+  const protoDisplay = proto.toUpperCase();
 
   if (selection.length > 10) {
     const fileContent = selection.join("\n");
@@ -924,7 +899,8 @@ function generateHTML() {
         // آرایه اصلاح شده فقط شامل پروتکل‌های استاندارد و ادغام شده برای UI
         const ALL_PROTOCOLS = [
             'vmess', 'vless', 'trojan', 'ss', 'ssr', 'tuic', 'hysteria', 'hysteria2', 
-            'juicity', 'snell', 'anytls', 'ssh', 'wireguard', 'socks', 'cloudflare'
+            'juicity', 'snell', 'anytls', 'ssh', 'wireguard', 'socks',
+  'dns', 'nm-dns', 'nm-vless', 'slipnet-enc', 'slipnet', 'slipstream', 'dnstt'
         ];
 
         const showToast = (msg, type = 'success') => {
@@ -964,14 +940,11 @@ function generateHTML() {
 
         const initProtocolsGrid = () => {
             const grid = document.getElementById('protocols-grid');
-            grid.innerHTML = ALL_PROTOCOLS.map(p => {
-                let badge = p === 'cloudflare' ? '<span class="badge">ویژه</span>' : '';
-                return \`
-                <div class="proto-item" \${p === 'cloudflare' ? 'style="border-color: var(--warning);"' : ''}>
-                    <label><input type="checkbox" id="chk_\${p}"> \${badge}\${p.toUpperCase()}</label>
-                    <input type="number" id="qty_\${p}" min="0" placeholder="تعداد">
-                </div>\`
-            }).join('');
+            grid.innerHTML = ALL_PROTOCOLS.map(p => `
+                <div class="proto-item">
+                    <label><input type="checkbox" id="chk_${p}"> ${p.toUpperCase()}</label>
+                    <input type="number" id="qty_${p}" min="0" placeholder="تعداد">
+                </div>`).join('');
         };
 
         async function loadData() {
