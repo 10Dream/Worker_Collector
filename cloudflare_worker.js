@@ -274,6 +274,51 @@ function fixWireguardConfig(link) {
   } catch (e) { return link; }
 }
 
+
+function isTelegramProxyLink(line) {
+  const low = String(line || '').toLowerCase();
+  return low.startsWith('tg://') || low.startsWith('https://t.me/proxy') || low.startsWith('https://t.me/socks');
+}
+
+function tryDecodeUrlEncoded(line) {
+  try {
+    if (/%[0-9a-fA-F]{2}/.test(line)) return decodeURIComponent(line);
+  } catch (e) {}
+  return line;
+}
+
+function tryDecodeBase64Blob(blob) {
+  try {
+    let raw = (blob || '').trim().replace(/-/g, '+').replace(/_/g, '/');
+    raw += '='.repeat((4 - raw.length % 4) % 4);
+    const txt = atob(raw);
+    if (!txt || txt.length < 8) return '';
+    return txt;
+  } catch (e) {
+    return '';
+  }
+}
+
+function normalizeCandidateLine(line) {
+  if (!line) return '';
+  let out = decodeHtmlEntities(String(line));
+  out = out.replace(/[​-‍﻿]/g, '').trim();
+  out = tryDecodeUrlEncoded(out);
+  return cleanLink(out.trim());
+}
+
+function extractExtraConfigsFromBlob(text) {
+  const out = [];
+  const b64Candidates = text.match(/[A-Za-z0-9_\/+\-=]{80,}/g) || [];
+  for (const b of b64Candidates.slice(0, 30)) {
+    const dec = tryDecodeBase64Blob(b);
+    if (dec && /(?:vmess|vless|trojan|ss|ssr|tuic|hysteria|hy2|wg|wireguard|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt):/i.test(dec)) {
+      out.push(...extractLinksFromText(dec));
+    }
+  }
+  return [...new Set(out)];
+}
+
 async function fetchAndFilterConfigs(sources, logger = null) {
   let configsByProtocol = {};
   ALL_PROTOCOLS.forEach(p => configsByProtocol[p] = new Set());
@@ -284,7 +329,16 @@ async function fetchAndFilterConfigs(sources, logger = null) {
     const stats = { channel, pages: 0, blocks: 0, todayBlocks: 0, extracted: 0, httpError: null };
     const messages = await scrapeRecentChannelMessages(channel, 12, stats, settingsLookbackHours(logger));
     diag.push({ ...stats, extracted: messages.length });
-    for (let line of messages) {
+    const expanded = [];
+    for (const m of messages) {
+      expanded.push(m);
+      expanded.push(...extractExtraConfigsFromBlob(m));
+    }
+
+    for (let line of expanded) {
+      line = normalizeCandidateLine(line);
+      if (!line || isTelegramProxyLink(line)) continue;
+
       let matchedCanonicalProto = null;
       const protoMatch = line.toLowerCase().match(/^([a-z0-9\-]+):(?:\/\/|\/)/);
       if (protoMatch) {
@@ -296,7 +350,6 @@ async function fetchAndFilterConfigs(sources, logger = null) {
           configsByProtocol[matchedCanonicalProto].add(cleanLink(line));
         }
       }
-
     }
   }
 
@@ -305,8 +358,9 @@ async function fetchAndFilterConfigs(sources, logger = null) {
 
   if (logger) {
     const total = ALL_PROTOCOLS.reduce((acc, p) => acc + result[p].length, 0);
+    const byProto = ALL_PROTOCOLS.map(p => `${p}:${result[p].length}`).join(', ');
     const summary = diag.map(d => `@${d.channel}: pages=${d.pages}, blocks=${d.blocks}, today=${d.todayBlocks}, links=${d.extracted}${d.httpError ? `, http=${d.httpError}` : ''}${d.noBlockPages ? `, noblock=${d.noBlockPages}` : ''}${d.pageLen ? `, len=${d.pageLen}` : ''}${d.hasChannelHeader === false ? ', header=no' : ''}`).join(' | ');
-    await logger.log("INFO", `CFG debug -> channels=${channels.length}, total=${total}; ${summary || 'no channels'}`);
+    await logger.log("INFO", `CFG debug -> channels=${channels.length}, total=${total}, byProto=[${byProto}]; ${summary || 'no channels'}`);
   }
 
   return result;
