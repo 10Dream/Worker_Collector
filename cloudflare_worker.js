@@ -6,7 +6,8 @@
 // لیست پروتکل‌های اصلی و استاندارد شده برای نمایش در منوها (ترکیب شده‌ها)
 const ALL_PROTOCOLS = [
   'vmess', 'vless', 'trojan', 'ss', 'ssr', 'tuic', 'hysteria', 'hysteria2', 
-  'juicity', 'snell', 'anytls', 'ssh', 'wireguard', 'socks', 'cloudflare'
+  'juicity', 'snell', 'anytls', 'ssh', 'wireguard', 'socks',
+  'dns', 'nm-dns', 'nm-vless', 'slipnet-enc', 'slipnet', 'slipstream', 'dnstt'
 ];
 
 // مپ کردن پیشوندهای لینک به پروتکل اصلی (ترکیب هوشمند)
@@ -28,12 +29,13 @@ const EXTRACT_PROTOCOLS = [
 
 const TG_PROXY_REGEX = /(?:https:\/\/t\.me\/(?:proxy|socks)\?[^\s<>"']+|tg:\/\/(?:proxy|socks)\?[^\s<>"']+)/gi;
 const CONFIG_REGEX = new RegExp(`(?:${EXTRACT_PROTOCOLS.map(p => p.replace('-', '\\-')).join('|')}):(?:\\/\\/|\\/)[^\\s<>"')\]]+`, 'gi');
+const NEXT_CONFIG_LOOKAHEAD = new RegExp(`(?=(?:${EXTRACT_PROTOCOLS.filter(p=>p!=='tg').map(p=>p.replace('-', '\\-')).join('|')}):(?:\\/\\/|\\/)|https:\\/\\/t\\.me\\/(?:proxy|socks)\\?|tg:\\/\\/(?:proxy|socks)\\?|[()\\[\\]\"'\\s])`, 'i');
 
 // ساختار پیش‌فرض تنظیمات با پروتکل‌های فعال اولیه
 const DEFAULT_PROTOCOLS_STATE = {};
 ALL_PROTOCOLS.forEach(p => {
   DEFAULT_PROTOCOLS_STATE[p] = { 
-    enabled: ['vless', 'vmess', 'trojan', 'wireguard', 'cloudflare'].includes(p), 
+    enabled: ['vless', 'vmess', 'trojan', 'wireguard', 'dns'].includes(p), 
     qty: 2 
   };
 });
@@ -47,10 +49,16 @@ const DEFAULT_SETTINGS = {
   rl_time: 60, // به دقیقه
   rl_reqs: 5, // تعداد درخواست مجاز در آن زمان
   post_qty: 10,
+  lookback_hours: 36,
   sources: ["@filembad"],
   config_sources: ["@filembad", "https://t.me/IranProxyPlus", "Capoit"],
   protocols: DEFAULT_PROTOCOLS_STATE
 };
+
+function getKV(env) {
+  return env.PROXY_KV || env.BOT_KV || null;
+}
+
 
 // ==========================================
 // کلاس لاگر و هشدارهای ادمین
@@ -63,7 +71,8 @@ class SystemLogger {
   }
 
   async log(level, message, notifyAdmin = false) {
-    if (!this.env.PROXY_KV) return;
+    const kv = getKV(this.env);
+    if (!kv) return;
     const timestamp = new Date().toLocaleString("fa-IR", { timeZone: "Asia/Tehran" });
     const logEntry = { ts: timestamp, level, msg: message };
     
@@ -75,12 +84,14 @@ class SystemLogger {
   }
 
   async _saveLog(entry) {
+    const kv = getKV(this.env);
+    if (!kv) return;
     try {
-      let logs = await this.env.PROXY_KV.get("system_logs", { type: "json" });
+      let logs = await kv.get("system_logs", { type: "json" });
       if (!logs || !Array.isArray(logs)) logs = [];
       logs.unshift(entry);
       if (logs.length > 50) logs = logs.slice(0, 50);
-      await this.env.PROXY_KV.put("system_logs", JSON.stringify(logs));
+      await kv.put("system_logs", JSON.stringify(logs));
     } catch (e) {
       if (e.message && e.message.toLowerCase().includes("limit") && this.settings && this.settings.admin_chat_id) {
         await sendTelegramMessage(this.env.BOT_TOKEN, this.settings.admin_chat_id, "🚨 <b>هشدار بحرانی:</b> محدودیت دیتابیس کلادفلر (KV Limits) پر شده است!");
@@ -89,7 +100,8 @@ class SystemLogger {
   }
 
   async clear() {
-    if (this.env.PROXY_KV) await this.env.PROXY_KV.delete("system_logs");
+    const kv = getKV(this.env);
+    if (kv) await kv.delete("system_logs");
   }
 }
 
@@ -98,7 +110,8 @@ export default {
   // هندلر زمان‌بندی (Cron Trigger)
   // ==========================================
   async scheduled(event, env, ctx) {
-    const settings = await getSettings(env.PROXY_KV);
+    const kv = getKV(env);
+    const settings = await getSettings(kv);
     const logger = new SystemLogger(env, ctx, settings);
     try {
       await processAutoPost(env, settings, logger);
@@ -112,7 +125,8 @@ export default {
   // ==========================================
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const settings = await getSettings(env.PROXY_KV);
+    const kv = getKV(env);
+    const settings = await getSettings(kv);
     const logger = new SystemLogger(env, ctx, settings);
 
     if (request.method === "POST" && url.pathname === "/webhook") {
@@ -134,10 +148,11 @@ export default {
     }
 
     if (url.pathname === "/api/logs") {
-      const logs = await env.PROXY_KV.get("system_logs", { type: "json" }) || [];
+      const kv = getKV(env);
+      const logs = kv ? (await kv.get("system_logs", { type: "json" }) || []) : [];
       const health = {
         bot_token: !!env.BOT_TOKEN,
-        kv_bound: !!env.PROXY_KV,
+        kv_bound: !!getKV(env),
         admin_pass: !!env.ADMIN_PASSWORD
       };
       return new Response(JSON.stringify({ logs, health }), { headers: { "Content-Type": "application/json" } });
@@ -155,7 +170,9 @@ export default {
       if (request.method === "POST") {
         const newSettings = await request.json();
         const merged = { ...settings, ...newSettings };
-        await env.PROXY_KV.put("app_settings", JSON.stringify(merged));
+        const kv = getKV(env);
+        if (!kv) return new Response(JSON.stringify({ success: false, error: "KV binding missing" }), { status: 500, headers: { "Content-Type": "application/json" } });
+        await kv.put("app_settings", JSON.stringify(merged));
         await logger.log("INFO", "تنظیمات سیستم توسط ادمین به‌روزرسانی شد.");
         return new Response(JSON.stringify({ success: true }));
       }
@@ -173,8 +190,11 @@ export default {
     }
 
     if (url.pathname === "/api/clear-history") {
-      await env.PROXY_KV.delete("sent_proxies");
-      await env.PROXY_KV.delete("sent_configs");
+      const kv = getKV(env);
+      if (kv) {
+        await kv.delete("sent_proxies");
+        await kv.delete("sent_configs");
+      }
       await logger.log("WARN", "تاریخچه جلوگیری از ارسال تکراری (پروکسی و کانفیگ) پاکسازی شد.");
       return new Response(JSON.stringify({ success: true }));
     }
@@ -254,57 +274,95 @@ function fixWireguardConfig(link) {
   } catch (e) { return link; }
 }
 
-function isBehindCloudflare(link) {
-  const cfDomains = ['.workers.dev', '.pages.dev', '.trycloudflare.com', 'chatgpt.com', 'cloudflare.com'];
-  const check = (d) => {
-    if (!d) return false;
-    const lowerD = d.toLowerCase();
-    return cfDomains.some(cf => lowerD.endsWith(cf) || lowerD === cf);
-  };
 
-  try {
-    if (link.toLowerCase().startsWith('vmess://')) {
-      let b64 = link.slice(8);
-      while (b64.length % 4 !== 0) b64 += '=';
-      let jsonStr = decodeURIComponent(escape(atob(b64)));
-      let data = JSON.parse(jsonStr);
-      return check(data.add) || check(data.host) || check(data.sni);
-    } else {
-      let dummyUrlStr = link.replace(/^[a-zA-Z0-9]+:\/\//i, 'http://');
-      let parsed = new URL(dummyUrlStr);
-      return check(parsed.hostname) || check(parsed.searchParams.get('sni')) || check(parsed.searchParams.get('host')) || check(parsed.searchParams.get('peer'));
-    }
-  } catch (e) { return false; }
+function isTelegramProxyLink(line) {
+  const low = String(line || '').toLowerCase();
+  return low.startsWith('tg://') || low.startsWith('https://t.me/proxy') || low.startsWith('https://t.me/socks');
 }
 
-async function fetchAndFilterConfigs(sources) {
+function tryDecodeUrlEncoded(line) {
+  try {
+    if (/%[0-9a-fA-F]{2}/.test(line)) return decodeURIComponent(line);
+  } catch (e) {}
+  return line;
+}
+
+function tryDecodeBase64Blob(blob) {
+  try {
+    let raw = (blob || '').trim().replace(/-/g, '+').replace(/_/g, '/');
+    raw += '='.repeat((4 - raw.length % 4) % 4);
+    const txt = atob(raw);
+    if (!txt || txt.length < 8) return '';
+    return txt;
+  } catch (e) {
+    return '';
+  }
+}
+
+function normalizeCandidateLine(line) {
+  if (!line) return '';
+  let out = decodeHtmlEntities(String(line));
+  out = out.replace(/[​-‍﻿]/g, '').trim();
+  out = tryDecodeUrlEncoded(out);
+  return cleanLink(out.trim());
+}
+
+function extractExtraConfigsFromBlob(text) {
+  const out = [];
+  const b64Candidates = text.match(/[A-Za-z0-9_\/+\-=]{80,}/g) || [];
+  for (const b of b64Candidates.slice(0, 30)) {
+    const dec = tryDecodeBase64Blob(b);
+    if (dec && /(?:vmess|vless|trojan|ss|ssr|tuic|hysteria|hy2|wg|wireguard|dns|nm-dns|nm-vless|slipnet-enc|slipnet|slipstream|dnstt):/i.test(dec)) {
+      out.push(...extractLinksFromText(dec));
+    }
+  }
+  return [...new Set(out)];
+}
+
+async function fetchAndFilterConfigs(sources, logger = null) {
   let configsByProtocol = {};
   ALL_PROTOCOLS.forEach(p => configsByProtocol[p] = new Set());
 
   const channels = [...new Set((sources || []).map(normalizeChannelInput).filter(Boolean))];
+  const diag = [];
   for (const channel of channels) {
-    const messages = await scrapeTodayChannelMessages(channel, 12);
-    for (let line of messages) {
+    const stats = { channel, pages: 0, blocks: 0, todayBlocks: 0, extracted: 0, httpError: null };
+    const messages = await scrapeRecentChannelMessages(channel, 12, stats, settingsLookbackHours(logger));
+    diag.push({ ...stats, extracted: messages.length });
+    const expanded = [];
+    for (const m of messages) {
+      expanded.push(m);
+      expanded.push(...extractExtraConfigsFromBlob(m));
+    }
+
+    for (let line of expanded) {
+      line = normalizeCandidateLine(line);
+      if (!line || isTelegramProxyLink(line)) continue;
+
       let matchedCanonicalProto = null;
       const protoMatch = line.toLowerCase().match(/^([a-z0-9\-]+):(?:\/\/|\/)/);
       if (protoMatch) {
         const raw = protoMatch[1];
         const mapped = PROTOCOL_ALIASES[raw] || raw;
-        if (ALL_PROTOCOLS.includes(mapped) && mapped !== 'cloudflare') {
+        if (ALL_PROTOCOLS.includes(mapped)) {
           matchedCanonicalProto = mapped;
           if (matchedCanonicalProto === 'wireguard') line = fixWireguardConfig(line);
           configsByProtocol[matchedCanonicalProto].add(cleanLink(line));
         }
-      }
-
-      if (matchedCanonicalProto && isBehindCloudflare(line)) {
-        configsByProtocol['cloudflare'].add(cleanLink(line));
       }
     }
   }
 
   let result = {};
   for (const p of ALL_PROTOCOLS) result[p] = Array.from(configsByProtocol[p]);
+
+  if (logger) {
+    const total = ALL_PROTOCOLS.reduce((acc, p) => acc + result[p].length, 0);
+    const byProto = ALL_PROTOCOLS.map(p => `${p}:${result[p].length}`).join(', ');
+    const summary = diag.map(d => `@${d.channel}: pages=${d.pages}, blocks=${d.blocks}, today=${d.todayBlocks}, links=${d.extracted}${d.httpError ? `, http=${d.httpError}` : ''}${d.noBlockPages ? `, noblock=${d.noBlockPages}` : ''}${d.pageLen ? `, len=${d.pageLen}` : ''}${d.hasChannelHeader === false ? ', header=no' : ''}`).join(' | ');
+    await logger.log("INFO", `CFG debug -> channels=${channels.length}, total=${total}, byProto=[${byProto}]; ${summary || 'no channels'}`);
+  }
+
   return result;
 }
 
@@ -333,15 +391,17 @@ async function handleTelegramUpdate(update, env, settings, logger) {
 
     if (settings.rl_enabled && (data.startsWith("get_") || data.startsWith("cfg_get_"))) {
       const rlKey = `rl_${chatId}`;
-      let rlData = await env.PROXY_KV.get(rlKey, { type: 'json' });
+      const kv = getKV(env);
+      if (!kv) return;
+      let rlData = await kv.get(rlKey, { type: 'json' });
       if (!rlData) {
-        await env.PROXY_KV.put(rlKey, JSON.stringify({ count: 1 }), { expirationTtl: settings.rl_time * 60 });
+        await kv.put(rlKey, JSON.stringify({ count: 1 }), { expirationTtl: settings.rl_time * 60 });
       } else {
         if (rlData.count >= settings.rl_reqs) {
           await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/answerCallbackQuery?callback_query_id=${cb.id}&text=${encodeURIComponent("⚠️ شما به محدودیت ضداسپم رسیده‌اید. لطفا بعدا تلاش کنید.")}&show_alert=true`);
           return;
         }
-        await env.PROXY_KV.put(rlKey, JSON.stringify({ count: rlData.count + 1 }), { expirationTtl: settings.rl_time * 60 });
+        await kv.put(rlKey, JSON.stringify({ count: rlData.count + 1 }), { expirationTtl: settings.rl_time * 60 });
       }
     }
 
@@ -368,7 +428,7 @@ async function handleTelegramUpdate(update, env, settings, logger) {
       let activeProtocols = Object.keys(settings.protocols).filter(p => settings.protocols[p].enabled);
       
       activeProtocols.forEach((p, index) => {
-        let btnText = p === 'cloudflare' ? '☁️ کلادفلر (ویژه)' : p.toUpperCase();
+        let btnText = p.toUpperCase();
         row.push({ text: btnText, callback_data: `cfg_sel_${p}` });
         if (row.length === 2 || index === activeProtocols.length - 1) {
           inline_keyboard.push(row);
@@ -385,7 +445,7 @@ async function handleTelegramUpdate(update, env, settings, logger) {
     }
     else if (data.startsWith("cfg_sel_")) {
       const proto = data.replace("cfg_sel_", "");
-      const protoName = proto === 'cloudflare' ? 'کلادفلر' : proto.toUpperCase();
+      const protoName = proto.toUpperCase();
       const keyboard = {
         inline_keyboard: [
           [{ text: "۵ عدد", callback_data: `cfg_get_${proto}_5` }, { text: "۱۰ عدد", callback_data: `cfg_get_${proto}_10` }],
@@ -420,7 +480,7 @@ async function handleTelegramUpdate(update, env, settings, logger) {
 
 async function sendProxiesToUser(chatId, type, env, sources, logger) {
   await sendTelegramMessage(env.BOT_TOKEN, chatId, "⏳ در حال استخراج و بررسی پروکسی...");
-  const { standard, windows } = await fetchAndFilterProxies(sources);
+  const { standard, windows } = await fetchAndFilterProxies(sources, logger);
   let selection = [];
   const REQ_AMOUNT = 20;
 
@@ -440,25 +500,30 @@ async function sendProxiesToUser(chatId, type, env, sources, logger) {
   }
 
   if (selection.length === 0) {
+    await logger.log("WARN", `no proxy found for user=${chatId}, type=${type}`);
     await sendTelegramMessage(env.BOT_TOKEN, chatId, "❌ پروکسی یافت نشد.");
     return;
   }
+  await logger.log("INFO", `proxy sent user=${chatId}, type=${type}, count=${selection.length}`);
   await sendTelegramMessage(env.BOT_TOKEN, chatId, `✅ لیست پروکسی‌های شما:\n\n${selection.join("\n")}`);
 }
 
 async function sendConfigsToUser(chatId, proto, qty, env, sources, logger) {
   await sendTelegramMessage(env.BOT_TOKEN, chatId, "⏳ در حال استخراج هوشمند کانفیگ...");
-  const allConfigs = await fetchAndFilterConfigs(sources);
+  const allConfigs = await fetchAndFilterConfigs(sources, logger);
   let available = allConfigs[proto] || [];
   
   if (available.length === 0) {
+    const totals = Object.entries(allConfigs).map(([k,v]) => `${k}:${(v||[]).length}`).join(', ');
+    await logger.log("WARN", `no config found for user=${chatId}, proto=${proto}, totals=[${totals}]`);
     await sendTelegramMessage(env.BOT_TOKEN, chatId, `❌ کانفیگ یافت نشد.`);
     return;
   }
+  await logger.log("INFO", `config candidates user=${chatId}, proto=${proto}, available=${available.length}, qty=${qty}`);
 
   shuffleArray(available);
   const selection = available.slice(0, qty === Infinity ? available.length : qty);
-  const protoDisplay = proto === 'cloudflare' ? 'Cloudflare' : proto.toUpperCase();
+  const protoDisplay = proto.toUpperCase();
 
   if (selection.length > 10) {
     const fileContent = selection.join("\n");
@@ -478,7 +543,8 @@ async function sendConfigsToUser(chatId, proto, qty, env, sources, logger) {
 // منطق ارسال خودکار کانال (Cron)
 // ==========================================
 async function processAutoPost(env, settings, logger) {
-  if (!env.PROXY_KV || !env.BOT_TOKEN) {
+  const kv = getKV(env);
+  if (!kv || !env.BOT_TOKEN) {
     await logger.log("ERROR", "KV یا توکن ربات تنظیم نشده است.");
     return;
   }
@@ -490,9 +556,11 @@ async function processAutoPost(env, settings, logger) {
 }
 
 async function processProxiesForChannel(env, settings, logger) {
-  const { standard, windows } = await fetchAndFilterProxies(settings.sources);
+  const { standard, windows } = await fetchAndFilterProxies(settings.sources, logger);
   let sentHistory = [];
-  const historyData = await env.PROXY_KV.get("sent_proxies");
+  const kv = getKV(env);
+  if (!kv) return;
+  const historyData = await kv.get("sent_proxies");
   if (historyData) sentHistory = JSON.parse(historyData);
   const sentSet = new Set(sentHistory);
 
@@ -537,16 +605,18 @@ async function processProxiesForChannel(env, settings, logger) {
 
   if (successfullySent.length > 0) {
     const updatedHistory = [...sentHistory, ...successfullySent].slice(-3000);
-    await env.PROXY_KV.put("sent_proxies", JSON.stringify(updatedHistory));
+    await kv.put("sent_proxies", JSON.stringify(updatedHistory));
     await logger.log("INFO", `ارسال پروکسی به کانال: ${successfullySent.length} عدد.`);
   }
 }
 
 async function processConfigsForChannel(env, settings, logger) {
-  const configsByProto = await fetchAndFilterConfigs(settings.config_sources);
+  const configsByProto = await fetchAndFilterConfigs(settings.config_sources, logger);
   
   let sentHistory = [];
-  const historyData = await env.PROXY_KV.get("sent_configs");
+  const kv = getKV(env);
+  if (!kv) return;
+  const historyData = await kv.get("sent_configs");
   if (historyData) sentHistory = JSON.parse(historyData);
   const sentSet = new Set(sentHistory);
 
@@ -585,7 +655,7 @@ async function processConfigsForChannel(env, settings, logger) {
 
   if (successfullySentConfigs.length > 0) {
     const updatedHistory = [...sentHistory, ...successfullySentConfigs].slice(-5000);
-    await env.PROXY_KV.put("sent_configs", JSON.stringify(updatedHistory));
+    await kv.put("sent_configs", JSON.stringify(updatedHistory));
     await logger.log("INFO", `ارسال کانفیگ به کانال: ${successfullySentConfigs.length} عدد.`);
   } else {
     await logger.log("ERROR", "خطا در ارسال کانفیگ به کانال. ربات در کانال ادمین نیست یا کانال اشتباه است.");
@@ -631,12 +701,15 @@ async function sendTelegramDocument(token, chatId, caption, filename, fileConten
   } catch (e) { return false; }
 }
 
-async function fetchAndFilterProxies(sources) {
+async function fetchAndFilterProxies(sources, logger = null) {
   let standard = [], windows = [], allSet = new Set();
   const channels = [...new Set((sources || []).map(normalizeChannelInput).filter(Boolean))];
+  const diag = [];
 
   for (const channel of channels) {
-    const messages = await scrapeTodayChannelMessages(channel, 12);
+    const stats = { channel, pages: 0, blocks: 0, todayBlocks: 0, extracted: 0, httpError: null };
+    const messages = await scrapeRecentChannelMessages(channel, 12, stats, settingsLookbackHours(logger));
+    diag.push({ ...stats, extracted: messages.length });
     for (const line of messages) {
       if (line.startsWith('tg://') || line.startsWith('https://t.me/')) allSet.add(cleanLink(line));
     }
@@ -645,6 +718,10 @@ async function fetchAndFilterProxies(sources) {
   for (const proxy of allSet) {
     if (isWindowsCompatible(proxy)) windows.push(proxy);
     else standard.push(proxy);
+  }
+  if (logger) {
+    const summary = diag.map(d => `@${d.channel}: pages=${d.pages}, blocks=${d.blocks}, today=${d.todayBlocks}, links=${d.extracted}${d.httpError ? `, http=${d.httpError}` : ''}${d.noBlockPages ? `, noblock=${d.noBlockPages}` : ''}${d.pageLen ? `, len=${d.pageLen}` : ''}${d.hasChannelHeader === false ? ', header=no' : ''}`).join(' | ');
+    await logger.log("INFO", `PRX debug -> channels=${channels.length}, total=${allSet.size}, windows=${windows.length}, standard=${standard.length}; ${summary || 'no channels'}`);
   }
   return { standard, windows };
 }
@@ -670,6 +747,15 @@ function shuffleArray(array) {
 }
 
 
+function settingsLookbackHours(logger) {
+  try {
+    const h = parseInt((logger && logger.settings && logger.settings.lookback_hours) || 36, 10);
+    return Number.isFinite(h) && h > 0 ? h : 36;
+  } catch (e) {
+    return 36;
+  }
+}
+
 function normalizeChannelInput(input) {
   if (!input) return null;
   const clean = String(input).trim();
@@ -688,47 +774,103 @@ function extractLinksFromText(text) {
   const cfg = text.match(CONFIG_REGEX) || [];
   const tg = text.match(TG_PROXY_REGEX) || [];
   out.push(...cfg, ...tg);
-  return out.map(cleanLink).filter(Boolean);
+
+  const protoPrefix = new RegExp(`(?:${EXTRACT_PROTOCOLS.map(p => p.replace('-', '\\-')).join('|')}):(?:\\/\\/|\\/)`, 'ig');
+  let m;
+  while ((m = protoPrefix.exec(text)) !== null) {
+    const startIdx = m.index;
+    const chunk = text.slice(startIdx);
+    const endMatch = chunk.match(NEXT_CONFIG_LOOKAHEAD);
+    let candidate = endMatch ? chunk.slice(0, endMatch.index) : chunk.slice(0, 700);
+    candidate = cleanLink(candidate.trim());
+    if (candidate.length > 6) out.push(candidate);
+  }
+
+  return [...new Set(out.map(cleanLink).filter(Boolean))];
 }
+
 
 function decodeHtmlEntities(s) {
   return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 }
 
-async function scrapeTodayChannelMessages(channel, maxPages = 12) {
-  const today = new Date().toISOString().slice(0, 10);
+
+function extractTelegramMessageBlocks(html) {
+  const patterns = [
+    /<article[^>]*class="[^"]*tgme_widget_message[^"]*"[\s\S]*?<\/article>/g,
+    /<div[^>]*class="[^"]*tgme_widget_message_wrap[^"]*"[\s\S]*?<\/div>\s*<\/div>/g,
+    /<div[^>]*class="[^"]*tgme_widget_message(?!_text)[^"]*"[\s\S]*?<\/div>\s*<\/div>/g
+  ];
+
+  for (const re of patterns) {
+    const arr = [...html.matchAll(re)].map(m => m[0]);
+    if (arr.length) return arr;
+  }
+  return [];
+}
+
+async function scrapeRecentChannelMessages(channel, maxPages = 12, stats = null, lookbackHours = 36) {
+  const threshold = Date.now() - lookbackHours * 60 * 60 * 1000;
   let before = '';
   const all = [];
 
   for (let i = 0; i < maxPages; i++) {
+    if (stats) stats.pages += 1;
     const url = `https://t.me/s/${channel}${before ? `?before=${before}` : ''}`;
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (!res.ok) break;
+    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', 'Accept-Language': 'en-US,en;q=0.9', 'Referer': 'https://t.me/' } });
+    if (!res.ok) { if (stats) stats.httpError = res.status; break; }
 
     const html = await res.text();
-    const blocks = [...html.matchAll(/<div class="tgme_widget_message"[\s\S]*?<\/div>\s*<\/div>/g)].map(m => m[0]);
-    if (!blocks.length) break;
+    if (stats && i === 0) {
+      stats.pageLen = html.length;
+      stats.hasChannelHeader = html.includes('tgme_channel_info') || html.includes('tgme_widget_message');
+    }
+
+    let blocks = extractTelegramMessageBlocks(html);
+    if (!blocks.length) {
+      const chunks = html.split('data-post="');
+      if (chunks.length > 1) {
+        blocks = chunks.slice(1).map(c => 'data-post="' + c).filter(c => c.includes('datetime="'));
+      }
+    }
+
+    if (!blocks.length) {
+      if (stats) stats.noBlockPages = (stats.noBlockPages || 0) + 1;
+      const full = decodeHtmlEntities(html.replace(/<[^>]*>/g, ' '));
+      all.push(...extractLinksFromText(full));
+      break;
+    }
+
+    if (stats) stats.blocks += blocks.length;
 
     let seenOlder = false;
     for (const block of blocks) {
       const dt = (block.match(/datetime="([^"]+)"/) || [])[1] || '';
       const post = (block.match(/data-post="[^"]+\/(\d+)"/) || [])[1] || '';
       if (post) before = post;
-      if (!dt) continue;
-      if (!dt.startsWith(today)) {
-        if (dt < `${today}T00:00:00`) seenOlder = true;
-        continue;
+
+      if (dt) {
+        const ts = new Date(dt).getTime();
+        if (Number.isFinite(ts)) {
+          if (ts < threshold) {
+            seenOlder = true;
+            continue;
+          }
+          if (stats) stats.todayBlocks += 1;
+        }
       }
+
       const plain = decodeHtmlEntities(block.replace(/<[^>]*>/g, ' '));
       all.push(...extractLinksFromText(plain));
     }
 
     if (seenOlder) break;
-    await new Promise(r => setTimeout(r, 600));
+    await new Promise(r => setTimeout(r, 700));
   }
 
-  return [...new Set(all)];
+  return [...new Set(all.map(cleanLink).filter(Boolean))];
 }
+
 
 function cleanLink(link) {
   return link.replace(/[()\[\]\s!.,;'"]+$/, '');
@@ -895,7 +1037,8 @@ function generateHTML() {
         // آرایه اصلاح شده فقط شامل پروتکل‌های استاندارد و ادغام شده برای UI
         const ALL_PROTOCOLS = [
             'vmess', 'vless', 'trojan', 'ss', 'ssr', 'tuic', 'hysteria', 'hysteria2', 
-            'juicity', 'snell', 'anytls', 'ssh', 'wireguard', 'socks', 'cloudflare'
+            'juicity', 'snell', 'anytls', 'ssh', 'wireguard', 'socks',
+  'dns', 'nm-dns', 'nm-vless', 'slipnet-enc', 'slipnet', 'slipstream', 'dnstt'
         ];
 
         const showToast = (msg, type = 'success') => {
@@ -935,14 +1078,11 @@ function generateHTML() {
 
         const initProtocolsGrid = () => {
             const grid = document.getElementById('protocols-grid');
-            grid.innerHTML = ALL_PROTOCOLS.map(p => {
-                let badge = p === 'cloudflare' ? '<span class="badge">ویژه</span>' : '';
-                return \`
-                <div class="proto-item" \${p === 'cloudflare' ? 'style="border-color: var(--warning);"' : ''}>
-                    <label><input type="checkbox" id="chk_\${p}"> \${badge}\${p.toUpperCase()}</label>
+            grid.innerHTML = ALL_PROTOCOLS.map(p => \`
+                <div class="proto-item">
+                    <label><input type="checkbox" id="chk_\${p}"> \${p.toUpperCase()}</label>
                     <input type="number" id="qty_\${p}" min="0" placeholder="تعداد">
-                </div>\`
-            }).join('');
+                </div>\`).join('');
         };
 
         async function loadData() {
