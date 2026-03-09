@@ -272,13 +272,16 @@ function fixWireguardConfig(link) {
   } catch (e) { return link; }
 }
 
-async function fetchAndFilterConfigs(sources) {
+async function fetchAndFilterConfigs(sources, logger = null) {
   let configsByProtocol = {};
   ALL_PROTOCOLS.forEach(p => configsByProtocol[p] = new Set());
 
   const channels = [...new Set((sources || []).map(normalizeChannelInput).filter(Boolean))];
+  const diag = [];
   for (const channel of channels) {
-    const messages = await scrapeTodayChannelMessages(channel, 12);
+    const stats = { channel, pages: 0, blocks: 0, todayBlocks: 0, extracted: 0, httpError: null };
+    const messages = await scrapeTodayChannelMessages(channel, 12, stats);
+    diag.push({ ...stats, extracted: messages.length });
     for (let line of messages) {
       let matchedCanonicalProto = null;
       const protoMatch = line.toLowerCase().match(/^([a-z0-9\-]+):(?:\/\/|\/)/);
@@ -297,6 +300,13 @@ async function fetchAndFilterConfigs(sources) {
 
   let result = {};
   for (const p of ALL_PROTOCOLS) result[p] = Array.from(configsByProtocol[p]);
+
+  if (logger) {
+    const total = ALL_PROTOCOLS.reduce((acc, p) => acc + result[p].length, 0);
+    const summary = diag.map(d => `@${d.channel}: pages=${d.pages}, blocks=${d.blocks}, today=${d.todayBlocks}, links=${d.extracted}${d.httpError ? `, http=${d.httpError}` : ''}`).join(' | ');
+    await logger.log("INFO", `CFG debug -> channels=${channels.length}, total=${total}; ${summary || 'no channels'}`);
+  }
+
   return result;
 }
 
@@ -414,7 +424,7 @@ async function handleTelegramUpdate(update, env, settings, logger) {
 
 async function sendProxiesToUser(chatId, type, env, sources, logger) {
   await sendTelegramMessage(env.BOT_TOKEN, chatId, "⏳ در حال استخراج و بررسی پروکسی...");
-  const { standard, windows } = await fetchAndFilterProxies(sources);
+  const { standard, windows } = await fetchAndFilterProxies(sources, logger);
   let selection = [];
   const REQ_AMOUNT = 20;
 
@@ -434,21 +444,26 @@ async function sendProxiesToUser(chatId, type, env, sources, logger) {
   }
 
   if (selection.length === 0) {
+    await logger.log("WARN", `no proxy found for user=${chatId}, type=${type}`);
     await sendTelegramMessage(env.BOT_TOKEN, chatId, "❌ پروکسی یافت نشد.");
     return;
   }
+  await logger.log("INFO", `proxy sent user=${chatId}, type=${type}, count=${selection.length}`);
   await sendTelegramMessage(env.BOT_TOKEN, chatId, `✅ لیست پروکسی‌های شما:\n\n${selection.join("\n")}`);
 }
 
 async function sendConfigsToUser(chatId, proto, qty, env, sources, logger) {
   await sendTelegramMessage(env.BOT_TOKEN, chatId, "⏳ در حال استخراج هوشمند کانفیگ...");
-  const allConfigs = await fetchAndFilterConfigs(sources);
+  const allConfigs = await fetchAndFilterConfigs(sources, logger);
   let available = allConfigs[proto] || [];
   
   if (available.length === 0) {
+    const totals = Object.entries(allConfigs).map(([k,v]) => `${k}:${(v||[]).length}`).join(', ');
+    await logger.log("WARN", `no config found for user=${chatId}, proto=${proto}, totals=[${totals}]`);
     await sendTelegramMessage(env.BOT_TOKEN, chatId, `❌ کانفیگ یافت نشد.`);
     return;
   }
+  await logger.log("INFO", `config candidates user=${chatId}, proto=${proto}, available=${available.length}, qty=${qty}`);
 
   shuffleArray(available);
   const selection = available.slice(0, qty === Infinity ? available.length : qty);
@@ -485,7 +500,7 @@ async function processAutoPost(env, settings, logger) {
 }
 
 async function processProxiesForChannel(env, settings, logger) {
-  const { standard, windows } = await fetchAndFilterProxies(settings.sources);
+  const { standard, windows } = await fetchAndFilterProxies(settings.sources, logger);
   let sentHistory = [];
   const kv = getKV(env);
   if (!kv) return;
@@ -540,7 +555,7 @@ async function processProxiesForChannel(env, settings, logger) {
 }
 
 async function processConfigsForChannel(env, settings, logger) {
-  const configsByProto = await fetchAndFilterConfigs(settings.config_sources);
+  const configsByProto = await fetchAndFilterConfigs(settings.config_sources, logger);
   
   let sentHistory = [];
   const kv = getKV(env);
@@ -630,12 +645,15 @@ async function sendTelegramDocument(token, chatId, caption, filename, fileConten
   } catch (e) { return false; }
 }
 
-async function fetchAndFilterProxies(sources) {
+async function fetchAndFilterProxies(sources, logger = null) {
   let standard = [], windows = [], allSet = new Set();
   const channels = [...new Set((sources || []).map(normalizeChannelInput).filter(Boolean))];
+  const diag = [];
 
   for (const channel of channels) {
-    const messages = await scrapeTodayChannelMessages(channel, 12);
+    const stats = { channel, pages: 0, blocks: 0, todayBlocks: 0, extracted: 0, httpError: null };
+    const messages = await scrapeTodayChannelMessages(channel, 12, stats);
+    diag.push({ ...stats, extracted: messages.length });
     for (const line of messages) {
       if (line.startsWith('tg://') || line.startsWith('https://t.me/')) allSet.add(cleanLink(line));
     }
@@ -644,6 +662,10 @@ async function fetchAndFilterProxies(sources) {
   for (const proxy of allSet) {
     if (isWindowsCompatible(proxy)) windows.push(proxy);
     else standard.push(proxy);
+  }
+  if (logger) {
+    const summary = diag.map(d => `@${d.channel}: pages=${d.pages}, blocks=${d.blocks}, today=${d.todayBlocks}, links=${d.extracted}${d.httpError ? `, http=${d.httpError}` : ''}`).join(' | ');
+    await logger.log("INFO", `PRX debug -> channels=${channels.length}, total=${allSet.size}, windows=${windows.length}, standard=${standard.length}; ${summary || 'no channels'}`);
   }
   return { standard, windows };
 }
@@ -694,15 +716,16 @@ function decodeHtmlEntities(s) {
   return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
 }
 
-async function scrapeTodayChannelMessages(channel, maxPages = 12) {
+async function scrapeTodayChannelMessages(channel, maxPages = 12, stats = null) {
   const today = new Date().toISOString().slice(0, 10);
   let before = '';
   const all = [];
 
   for (let i = 0; i < maxPages; i++) {
+    if (stats) stats.pages += 1;
     const url = `https://t.me/s/${channel}${before ? `?before=${before}` : ''}`;
     const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (!res.ok) break;
+    if (!res.ok) { if (stats) stats.httpError = res.status; break; }
 
     const html = await res.text();
     let blocks = [...html.matchAll(/<div class="tgme_widget_message_wrap"[\s\S]*?<\/article>\s*<\/div>/g)].map(m => m[0]);
@@ -710,6 +733,7 @@ async function scrapeTodayChannelMessages(channel, maxPages = 12) {
       blocks = [...html.matchAll(/<div class="tgme_widget_message"[\s\S]*?<\/div>\s*<\/div>/g)].map(m => m[0]);
     }
     if (!blocks.length) break;
+    if (stats) stats.blocks += blocks.length;
 
     let seenOlder = false;
     for (const block of blocks) {
