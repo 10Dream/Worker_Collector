@@ -29,6 +29,7 @@ const EXTRACT_PROTOCOLS = [
 
 const TG_PROXY_REGEX = /(?:https:\/\/t\.me\/(?:proxy|socks)\?[^\s<>"']+|tg:\/\/(?:proxy|socks)\?[^\s<>"']+)/gi;
 const CONFIG_REGEX = new RegExp(`(?:${EXTRACT_PROTOCOLS.map(p => p.replace('-', '\\-')).join('|')}):(?:\\/\\/|\\/)[^\\s<>"')\]]+`, 'gi');
+const NEXT_CONFIG_LOOKAHEAD = new RegExp(`(?=(?:${EXTRACT_PROTOCOLS.filter(p=>p!=='tg').map(p=>p.replace('-', '\\-')).join('|')}):(?:\\/\\/|\\/)|https:\\/\\/t\\.me\\/(?:proxy|socks)\\?|tg:\\/\\/(?:proxy|socks)\\?|[()\\[\\]\"'\\s])`, 'i');
 
 // ساختار پیش‌فرض تنظیمات با پروتکل‌های فعال اولیه
 const DEFAULT_PROTOCOLS_STATE = {};
@@ -48,6 +49,7 @@ const DEFAULT_SETTINGS = {
   rl_time: 60, // به دقیقه
   rl_reqs: 5, // تعداد درخواست مجاز در آن زمان
   post_qty: 10,
+  lookback_hours: 36,
   sources: ["@filembad"],
   config_sources: ["@filembad", "https://t.me/IranProxyPlus", "Capoit"],
   protocols: DEFAULT_PROTOCOLS_STATE
@@ -280,7 +282,7 @@ async function fetchAndFilterConfigs(sources, logger = null) {
   const diag = [];
   for (const channel of channels) {
     const stats = { channel, pages: 0, blocks: 0, todayBlocks: 0, extracted: 0, httpError: null };
-    const messages = await scrapeTodayChannelMessages(channel, 12, stats);
+    const messages = await scrapeRecentChannelMessages(channel, 12, stats, settingsLookbackHours(logger));
     diag.push({ ...stats, extracted: messages.length });
     for (let line of messages) {
       let matchedCanonicalProto = null;
@@ -652,7 +654,7 @@ async function fetchAndFilterProxies(sources, logger = null) {
 
   for (const channel of channels) {
     const stats = { channel, pages: 0, blocks: 0, todayBlocks: 0, extracted: 0, httpError: null };
-    const messages = await scrapeTodayChannelMessages(channel, 12, stats);
+    const messages = await scrapeRecentChannelMessages(channel, 12, stats, settingsLookbackHours(logger));
     diag.push({ ...stats, extracted: messages.length });
     for (const line of messages) {
       if (line.startsWith('tg://') || line.startsWith('https://t.me/')) allSet.add(cleanLink(line));
@@ -691,6 +693,15 @@ function shuffleArray(array) {
 }
 
 
+function settingsLookbackHours(logger) {
+  try {
+    const h = parseInt((logger && logger.settings && logger.settings.lookback_hours) || 36, 10);
+    return Number.isFinite(h) && h > 0 ? h : 36;
+  } catch (e) {
+    return 36;
+  }
+}
+
 function normalizeChannelInput(input) {
   if (!input) return null;
   const clean = String(input).trim();
@@ -709,8 +720,21 @@ function extractLinksFromText(text) {
   const cfg = text.match(CONFIG_REGEX) || [];
   const tg = text.match(TG_PROXY_REGEX) || [];
   out.push(...cfg, ...tg);
-  return out.map(cleanLink).filter(Boolean);
+
+  const protoPrefix = new RegExp(`(?:${EXTRACT_PROTOCOLS.map(p => p.replace('-', '\\-')).join('|')}):(?:\\/\\/|\\/)`, 'ig');
+  let m;
+  while ((m = protoPrefix.exec(text)) !== null) {
+    const startIdx = m.index;
+    const chunk = text.slice(startIdx);
+    const endMatch = chunk.match(NEXT_CONFIG_LOOKAHEAD);
+    let candidate = endMatch ? chunk.slice(0, endMatch.index) : chunk.slice(0, 700);
+    candidate = cleanLink(candidate.trim());
+    if (candidate.length > 6) out.push(candidate);
+  }
+
+  return [...new Set(out.map(cleanLink).filter(Boolean))];
 }
+
 
 function decodeHtmlEntities(s) {
   return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
@@ -731,8 +755,8 @@ function extractTelegramMessageBlocks(html) {
   return [];
 }
 
-async function scrapeTodayChannelMessages(channel, maxPages = 12, stats = null) {
-  const today = new Date().toISOString().slice(0, 10);
+async function scrapeRecentChannelMessages(channel, maxPages = 12, stats = null, lookbackHours = 36) {
+  const threshold = Date.now() - lookbackHours * 60 * 60 * 1000;
   let before = '';
   const all = [];
 
@@ -750,7 +774,6 @@ async function scrapeTodayChannelMessages(channel, maxPages = 12, stats = null) 
 
     let blocks = extractTelegramMessageBlocks(html);
     if (!blocks.length) {
-      // آخرین fallback: قطعه‌بندی بر اساس data-post
       const chunks = html.split('data-post="');
       if (chunks.length > 1) {
         blocks = chunks.slice(1).map(c => 'data-post="' + c).filter(c => c.includes('datetime="'));
@@ -759,8 +782,11 @@ async function scrapeTodayChannelMessages(channel, maxPages = 12, stats = null) 
 
     if (!blocks.length) {
       if (stats) stats.noBlockPages = (stats.noBlockPages || 0) + 1;
+      const full = decodeHtmlEntities(html.replace(/<[^>]*>/g, ' '));
+      all.push(...extractLinksFromText(full));
       break;
     }
+
     if (stats) stats.blocks += blocks.length;
 
     let seenOlder = false;
@@ -768,23 +794,29 @@ async function scrapeTodayChannelMessages(channel, maxPages = 12, stats = null) 
       const dt = (block.match(/datetime="([^"]+)"/) || [])[1] || '';
       const post = (block.match(/data-post="[^"]+\/(\d+)"/) || [])[1] || '';
       if (post) before = post;
-      if (!dt) continue;
-      const d = new Date(dt);
-      const dKey = isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
-      if (dKey !== today) {
-        if (dKey && dKey < today) seenOlder = true;
-        continue;
+
+      if (dt) {
+        const ts = new Date(dt).getTime();
+        if (Number.isFinite(ts)) {
+          if (ts < threshold) {
+            seenOlder = true;
+            continue;
+          }
+          if (stats) stats.todayBlocks += 1;
+        }
       }
+
       const plain = decodeHtmlEntities(block.replace(/<[^>]*>/g, ' '));
       all.push(...extractLinksFromText(plain));
     }
 
     if (seenOlder) break;
-    await new Promise(r => setTimeout(r, 600));
+    await new Promise(r => setTimeout(r, 700));
   }
 
-  return [...new Set(all)];
+  return [...new Set(all.map(cleanLink).filter(Boolean))];
 }
+
 
 function cleanLink(link) {
   return link.replace(/[()\[\]\s!.,;'"]+$/, '');
